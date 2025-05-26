@@ -2,6 +2,7 @@ This is just controller for Keyhunt and it´s beta version.
 
 Every suggestion for improvement or anything else is welcome, contact me->  opsalter@outlook.com 
 
+Statistics website: https://xetel.duckdns.org
 
 How to use?
 
