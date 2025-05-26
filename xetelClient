@@ -1,0 +1,377 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+class Program
+{
+    private static readonly string DataDir = AppDomain.CurrentDomain.BaseDirectory;
+    private static readonly string ConfigFile = Path.Combine(DataDir, "client_config.json");
+    private static string btcAddress = "";
+    private static string serverIp = "ipaddress";
+    private static int serverPort = port;
+    private static string keyhuntPath = "keyhunt";
+    private static string keyhuntArgs = "";
+    private static string KeyhuntConfigFile => Path.Combine(DataDir, "keyhunt_config.json");
+
+    static Process keyhuntProc = null;
+    static CancellationTokenSource keyhuntCancelSource = null;
+    static object keyhuntLock = new object();
+    static bool exitRequested = false;
+
+    static async Task Main(string[] args)
+    {
+        Console.Title = "Puzzle135 Keyhunt Client v0.1 BETA - Donations: bc1q89j039meqtn6hr225mhhmavyn0vusyeygdzccc";
+        LoadConfig();
+        if (string.IsNullOrWhiteSpace(btcAddress))
+        {
+            Console.WriteLine("Enter your Bitcoin address:");
+            btcAddress = Console.ReadLine()?.Trim();
+            File.WriteAllText(ConfigFile, $"{{\"user\":\"{btcAddress}\"}}");
+        }
+        LoadKeyhuntConfig();
+        if (string.IsNullOrWhiteSpace(keyhuntArgs))
+        {
+            Console.WriteLine("First run: Please enter keyhunt -t and -k arguments (e.g. -t 8 -k 256 ):");
+            Console.Write(">");
+            keyhuntArgs = Console.ReadLine()?.Trim();
+            SaveKeyhuntConfig();
+        }
+        if (!KeyhuntExecutableAvailable())
+        {
+            Console.WriteLine("[ERROR] keyhunt executable not found. Please ensure it's in the PATH or specify the full path in the config.");
+            Console.WriteLine("Press Enter to exit.");
+            Console.ReadLine();
+            return;
+        }
+        Console.WriteLine($"\nClient ready as user: {btcAddress}");
+        Console.WriteLine("Starting auto range/keyhunt loop. Press Ctrl+C to exit.");
+        Console.WriteLine("Press 'S' at any time to STOP keyhunt and exit the client.");
+        var keyListenerThread = new Thread(KeyListener) { IsBackground = true };
+        keyListenerThread.Start();
+        await AutoKeyhuntLoop();
+    }
+
+    static void KeyListener()
+    {
+        while (true)
+        {
+            var key = Console.ReadKey(true);
+            if (key.Key == ConsoleKey.S)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[USER] 'S' pressed: Attempting to stop keyhunt and exit client!");
+                Console.ResetColor();
+                KillKeyhunt();
+                exitRequested = true;
+                Environment.Exit(0);
+            }
+        }
+    }
+
+    static void KillKeyhunt()
+    {
+        lock (keyhuntLock)
+        {
+            if (keyhuntProc != null && !keyhuntProc.HasExited)
+            {
+                try
+                {
+                    keyhuntProc.Kill();
+                    Console.WriteLine("[KEYHUNT] Keyhunt process killed by user.");
+                }
+                catch { }
+            }
+            if (keyhuntCancelSource != null)
+            {
+                keyhuntCancelSource.Cancel();
+            }
+        }
+    }
+
+    static void LoadConfig()
+    {
+        if (!File.Exists(ConfigFile)) return;
+        try
+        {
+            var doc = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(ConfigFile));
+            btcAddress = doc.TryGetValue("user", out var addr) ? addr : "";
+        }
+        catch
+        {
+            Console.WriteLine("Warning: Failed to load config. Will prompt for BTC address.");
+        }
+    }
+
+    static void LoadKeyhuntConfig()
+    {
+        if (!File.Exists(KeyhuntConfigFile)) return;
+        try
+        {
+            var doc = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(KeyhuntConfigFile));
+            keyhuntArgs = doc.TryGetValue("keyhuntArgs", out var a) ? a : "";
+            keyhuntPath = doc.TryGetValue("keyhuntPath", out var p) ? p : keyhuntPath;
+        }
+        catch
+        {
+            Console.WriteLine("Warning: Failed to load keyhunt config.");
+        }
+    }
+
+    static void SaveKeyhuntConfig()
+    {
+        var doc = new Dictionary<string, string>
+        {
+            ["keyhuntArgs"] = keyhuntArgs,
+            ["keyhuntPath"] = keyhuntPath
+        };
+        File.WriteAllText(KeyhuntConfigFile, JsonSerializer.Serialize(doc));
+    }
+
+    static bool KeyhuntExecutableAvailable()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = keyhuntPath,
+                Arguments = "--help",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            proc.WaitForExit(3000);
+            return proc.ExitCode == 0 || proc.ExitCode == 1;
+        }
+        catch { return false; }
+    }
+
+    static async Task AutoKeyhuntLoop()
+    {
+        while (!exitRequested)
+        {
+            string start = null, end = null;
+
+            // 1. Ask server for a range
+            using (var client = new TcpClient())
+            {
+                try
+                {
+                    await client.ConnectAsync(serverIp, serverPort);
+                    using var netStream = client.GetStream();
+                    using var writer = new StreamWriter(netStream, Encoding.UTF8) { AutoFlush = true };
+                    using var reader = new StreamReader(netStream, Encoding.UTF8);
+
+                    var req = new { action = "request_range", user = btcAddress };
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(req));
+                    string responseLine = await reader.ReadLineAsync();
+                    var resp = JsonSerializer.Deserialize<Dictionary<string, object>>(responseLine);
+                    if (resp != null && resp.TryGetValue("status", out var st) && st.ToString() == "success")
+                    {
+                        start = resp["start"].ToString();
+                        end = resp["end"].ToString();
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"[SERVER] Assigned range: {start} - {end}");
+                        Console.ResetColor();
+                    }
+                    else
+                    {
+                        Console.WriteLine("[SERVER] Could not get range, retrying in 10 seconds...");
+                        await Task.Delay(10000);
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[SERVER] Communication error: " + ex.Message);
+                    await Task.Delay(10000);
+                    continue;
+                }
+            }
+
+            // 2. Validate the range for keyhunt
+            if (!IsValidKeyhuntRange(start, end))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[KEYHUNT][ERR] Invalid range received from server. The range must span exactly the last 16 hex digits (64 bits).");
+                Console.ResetColor();
+                Console.WriteLine($"Received: {start} - {end}");
+                Console.WriteLine("Waiting 10 seconds before retrying...");
+                await Task.Delay(10000);
+                continue;
+            }
+
+            // 3. Run keyhunt for the assigned range
+            string fullArgs = $"-m bsgs -B sequential -S -s 15 -f 135.txt -r {start}:{end} {keyhuntArgs}";
+            Console.WriteLine($"[KEYHUNT] Launching: {keyhuntPath} {fullArgs}");
+            int exitCode = -1;
+            keyhuntCancelSource = new CancellationTokenSource();
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = keyhuntPath,
+                    Arguments = fullArgs,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                using (var proc = Process.Start(psi))
+                {
+                    lock (keyhuntLock) { keyhuntProc = proc; }
+                    proc.OutputDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) Console.WriteLine("[KEYHUNT] " + e.Data); };
+                    proc.ErrorDataReceived += (s, e) => { if (!string.IsNullOrEmpty(e.Data)) Console.WriteLine("[KEYHUNT][ERR] " + e.Data); };
+                    proc.BeginOutputReadLine();
+                    proc.BeginErrorReadLine();
+
+                    // Wait for either process exit or cancellation
+                    var waitTask = Task.Run(() => proc.WaitForExit());
+                    while (!waitTask.IsCompleted)
+                    {
+                        if (keyhuntCancelSource.Token.IsCancellationRequested)
+                        {
+                            try
+                            {
+                                if (!proc.HasExited)
+                                    proc.Kill();
+                            }
+                            catch { }
+                            break;
+                        }
+                        await Task.Delay(300);
+                    }
+                    exitCode = proc.HasExited ? proc.ExitCode : -999;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[KEYHUNT] Failed to run keyhunt: " + ex.Message);
+                Console.WriteLine("Waiting 10 seconds before retrying...");
+                await Task.Delay(10000);
+                continue;
+            }
+            finally
+            {
+                lock (keyhuntLock) { keyhuntProc = null; }
+                keyhuntCancelSource = null;
+            }
+
+            if (exitRequested)
+                Environment.Exit(0);
+
+            if (exitCode == -999)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("[KEYHUNT] Keyhunt killed/skipped by user. Client will now exit.");
+                Console.ResetColor();
+                Environment.Exit(0);
+            }
+            if (exitCode != 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[KEYHUNT] Keyhunt exited abnormally. Check output above.");
+                Console.ResetColor();
+                Console.WriteLine("Press Enter to retry or Ctrl+C to exit.");
+                Console.ReadLine();
+                continue;
+            }
+
+            // 4. Report complete to server
+            using (var client = new TcpClient())
+            {
+                try
+                {
+                    await client.ConnectAsync(serverIp, serverPort);
+                    using var netStream = client.GetStream();
+                    using var writer = new StreamWriter(netStream, Encoding.UTF8) { AutoFlush = true };
+                    using var reader = new StreamReader(netStream, Encoding.UTF8);
+
+                    var req = new { action = "report_complete", user = btcAddress, start = start, end = end };
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(req));
+                    string responseLine = await reader.ReadLineAsync();
+                    var resp = JsonSerializer.Deserialize<Dictionary<string, object>>(responseLine);
+                    if (resp != null && resp.TryGetValue("status", out var st) && st.ToString() == "success")
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine("[SERVER] Range marked as complete.");
+                        Console.ResetColor();
+                    }
+                    else
+                    {
+                        Console.WriteLine("[SERVER] Failed to report completion.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[SERVER] Communication error (report complete): " + ex.Message);
+                }
+            }
+
+            // 5. Fetch and display leaderboard
+            try
+            {
+                using (var client = new TcpClient())
+                {
+                    await client.ConnectAsync(serverIp, serverPort);
+                    using var netStream = client.GetStream();
+                    using var writer = new StreamWriter(netStream, Encoding.UTF8) { AutoFlush = true };
+                    using var reader = new StreamReader(netStream, Encoding.UTF8);
+
+                    var req = new { action = "leaderboard" };
+                    await writer.WriteLineAsync(JsonSerializer.Serialize(req));
+                    string responseLine = await reader.ReadLineAsync();
+                    var resp = JsonSerializer.Deserialize<Dictionary<string, object>>(responseLine);
+                    if (resp != null && resp.TryGetValue("status", out var st) && st.ToString() == "success")
+                    {
+                        var lbJson = resp["leaderboard"].ToString();
+                        var leaderboard = JsonSerializer.Deserialize<List<LeaderboardEntry>>(lbJson ?? "[]");
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.WriteLine("---- Leaderboard (Top 10) ----");
+                        int idx = 1;
+                        foreach (var entry in leaderboard)
+                        {
+                            string me = (entry.User == btcAddress) ? "<-- you" : "";
+                            Console.WriteLine($"{idx,2}. {entry.User,-42} {entry.Completed,8} {me}");
+                            idx++;
+                        }
+                        Console.WriteLine("------------------------------");
+                        Console.ResetColor();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[SERVER] Could not fetch leaderboard: " + ex.Message);
+            }
+        }
+    }
+
+    static bool IsValidKeyhuntRange(string start, string end)
+    {
+        if (start == null || end == null) return false;
+        if (start.Length != 34 || end.Length != 34) return false;
+        string prefixStart = start.Substring(0, 18);
+        string prefixEnd = end.Substring(0, 18);
+        string suffixStart = start.Substring(18, 16);
+        string suffixEnd = end.Substring(18, 16);
+
+        if (prefixStart != prefixEnd) return false;
+        if (suffixStart != "0000000000000000") return false;
+        if (!suffixEnd.Equals("ffffffffffffffff", StringComparison.OrdinalIgnoreCase)) return false;
+        return true;
+    }
+}
+
+public class LeaderboardEntry
+{
+    public string User { get; set; }
+    public int Completed { get; set; }
+}
